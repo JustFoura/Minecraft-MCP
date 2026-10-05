@@ -1,0 +1,27 @@
+{
+	"schemaVersion": 1,
+	"id": "minecraft-mcp",
+	"version": "${version}",
+	"name": "Minecraft-MCP",
+	"description": "A local, permission-limited debug bridge for Codex and other MCP clients.",
+	"authors": [
+		"Minecraft MCP contributors"
+	],
+	"license": "MIT",
+	"icon": "assets/minecraft-mcp/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"minecraftmcp.MinecraftMCP"
+		],
+		"client": [
+			"minecraftmcp.client.MinecraftMCPClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

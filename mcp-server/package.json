@@ -1,0 +1,20 @@
+{
+  "name": "minecraft-mcp-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local stdio MCP adapter for the Minecraft MCP Fabric client mod",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "smoke": "node ../scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  }
+}
