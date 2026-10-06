@@ -31,6 +31,16 @@ dependencies {
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 }
 
+tasks.named("runClient", JavaExec).configure {
+	systemProperty("minecraft-mcp.port", providers.gradleProperty("minecraft_mcp_port").getOrElse("8765"))
+}
+
+tasks.register("smokeModJar", Jar) {
+	archiveFileName = "mcp-smoke-probe.jar"
+	destinationDirectory = layout.buildDirectory.dir("smoke-mod")
+	from("src/smokeMod/resources")
+}
+
 processResources {
 	def version = project.version
 	inputs.property "version", version

@@ -3,9 +3,20 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const baseUrl = process.env.MINECRAFT_MCP_URL ?? "http://127.0.0.1:8765";
+let baseUrl = process.env.MINECRAFT_MCP_URL ?? "";
 const tokenFile = process.env.MINECRAFT_MCP_TOKEN_FILE
   ?? resolve(projectRoot, "run/config/minecraft-mcp/bridge-token.txt");
+const bridgePortFile = resolve(projectRoot, "run/config/minecraft-mcp/bridge-port.txt");
+
+async function initializeBaseUrl() {
+  if (baseUrl) return;
+  let port = 8765;
+  try {
+    const configured = Number((await readFile(bridgePortFile, "utf8")).trim());
+    if (Number.isInteger(configured) && configured >= 1024 && configured <= 65535) port = configured;
+  } catch { /* Default to the first-run bridge port. */ }
+  baseUrl = `http://127.0.0.1:${port}`;
+}
 
 function requireLoopbackUrl(value) {
   let url;
@@ -42,6 +53,7 @@ function requireJson(response, expectedStatus, label) {
 }
 
 async function main() {
+  await initializeBaseUrl();
   requireLoopbackUrl(baseUrl);
 
   const healthResponse = await request("/health");

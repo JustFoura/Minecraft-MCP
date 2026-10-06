@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "mcp_smoke_probe",
+  "version": "1.0.0",
+  "name": "Minecraft MCP Smoke Probe",
+  "environment": "*",
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3"
+  }
+}

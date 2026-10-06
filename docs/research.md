@@ -23,7 +23,7 @@ The mod is client-side for the debug controls. It puts a small authenticated HTT
 
 ## Codex and MCP integration
 
-Codex supports local MCP servers over stdio. This project uses the official TypeScript MCP SDK package `@modelcontextprotocol/sdk` for tool discovery and stdio transport. The MCP adapter translates a narrow set of typed tools to HTTP calls at `127.0.0.1:8765`; the Fabric mod authenticates those requests with a random local bearer token. Keeping game control in an explicit tool set avoids exposing shell or arbitrary Minecraft commands as MCP tools.
+Codex supports local MCP servers over stdio. This project uses the official TypeScript MCP SDK package `@modelcontextprotocol/sdk` for tool discovery and stdio transport. The MCP adapter translates typed tools to a per-project loopback HTTP bridge; the Fabric mod authenticates those requests with a random local bearer token. Minecraft slash commands are a separate bounded tool restricted to MCP-generated local single-player worlds; shell and Gradle command execution are not exposed.
 
 The adapter is registered in the current user's Codex configuration under `minecraft-debug`, using an absolute Node entrypoint and `MINECRAFT_MCP_TOKEN_FILE`. Codex's official MCP docs describe `codex mcp add`, `codex mcp list`, stdio command/args/env fields, and `/mcp` for inspecting active server connections. A Codex reload is needed after adding a server for the current session to refresh its tool catalog.
 

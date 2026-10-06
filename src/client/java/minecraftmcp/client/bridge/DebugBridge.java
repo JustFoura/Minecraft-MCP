@@ -3,8 +3,10 @@ package minecraftmcp.client.bridge;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
+import com.mojang.logging.LogUtils;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import org.slf4j.Logger;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -64,7 +66,8 @@ import java.util.concurrent.TimeUnit;
 
 /** Local-only HTTP control surface. MCP itself is provided by the companion stdio process. */
 public final class DebugBridge {
-	private static final int PORT = 8765;
+	private static final Logger LOGGER = LogUtils.getLogger();
+	private static final int PORT = configuredPort();
 	private static final int MAX_BODY_BYTES = 8 * 1024;
 	private static final int MAX_SCREENSHOT_BYTES = 6 * 1024 * 1024;
 	private static final long MAX_SNAPSHOT_BYTES = 1024L * 1024L * 1024L;
@@ -80,8 +83,15 @@ public final class DebugBridge {
 	private static volatile long screenRevision;
 	private static volatile int movementTicksRemaining;
 	private static KeyMapping activeMovementKey;
+	private static String activeMovementDirection;
+	private static int movementRequestedTicks;
+	private static Map<String, Object> movementStart;
+	private static CompletableFuture<Map<String, Object>> movementCompletion;
 	private static volatile int interactionTicksRemaining;
 	private static KeyMapping activeInteractionKey;
+	private static int activeInteractionTicks;
+	private static CompletableFuture<Map<String, Object>> interactionCompletion;
+	private static Boolean pauseOnLostFocusBeforeAutomation;
 	private static String token;
 	private static long serverTickStartedAt;
 	private static long serverTickPreviousStartAt;
@@ -93,6 +103,17 @@ public final class DebugBridge {
 	private static volatile long createWorldMenuPendingUntil;
 
 	private DebugBridge() {}
+
+	private static int configuredPort() {
+		String configured = System.getProperty("minecraft-mcp.port", "8765");
+		try {
+			int port = Integer.parseInt(configured);
+			if (port < 1024 || port > 65535) throw new NumberFormatException("port out of range");
+			return port;
+		} catch (NumberFormatException exception) {
+			throw new ExceptionInInitializerError("minecraft-mcp.port must be an integer from 1024 to 65535");
+		}
+	}
 
 	public static void trackScreens() {
 		net.fabricmc.fabric.api.client.screen.v1.ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
@@ -108,7 +129,10 @@ public final class DebugBridge {
 			}
 			activeScreen = screen;
 			currentScreen = screen.getClass().getSimpleName();
-			if (screen instanceof TitleScreen || screen instanceof SelectWorldScreen) createWorldMenuPendingUntil = 0L;
+			if (screen instanceof TitleScreen || screen instanceof SelectWorldScreen) {
+				createWorldMenuPendingUntil = 0L;
+				if (client.player == null && client.level == null) restorePauseOnLostFocus(client);
+			}
 			screenRevision++;
 			ScreenEvents.remove(screen).register(removed -> {
 				if (activeScreen == removed) {
@@ -120,14 +144,10 @@ public final class DebugBridge {
 		});
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (activeMovementKey != null && (client.player == null || !"none".equals(currentScreen) || --movementTicksRemaining <= 0)) {
-				activeMovementKey.setDown(false);
-				activeMovementKey = null;
-				movementTicksRemaining = 0;
+				finishMovement(client);
 			}
 			if (activeInteractionKey != null && (client.player == null || !"none".equals(currentScreen) || --interactionTicksRemaining <= 0)) {
-				activeInteractionKey.setDown(false);
-				activeInteractionKey = null;
-				interactionTicksRemaining = 0;
+				finishInteraction(client);
 			}
 		});
 		ServerTickEvents.START_SERVER_TICK.register(server -> {
@@ -136,13 +156,15 @@ public final class DebugBridge {
 			serverTickStartedAt = now;
 			serverTickPreviousStartAt = now;
 			if (server instanceof IntegratedServer && System.currentTimeMillis() < createWorldMenuPendingUntil) {
-				Path worldRoot = server.getWorldPath(LevelResource.ROOT);
-				Path folder = worldRoot.getFileName();
-				if (folder != null) {
-					try { registerGeneratedWorldId(folder.toString()); }
-					catch (IOException ignored) { }
+				String worldId = currentSingleplayerWorldId(Minecraft.getInstance());
+				if (!worldId.isEmpty()) {
+					try {
+						registerGeneratedWorldId(worldId);
+						createWorldMenuPendingUntil = 0L;
+					} catch (IOException exception) {
+						LOGGER.error("Could not register a world created through the vanilla Create World menu", exception);
+					}
 				}
-				createWorldMenuPendingUntil = 0L;
 			}
 		});
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
@@ -162,6 +184,53 @@ public final class DebugBridge {
 		});
 	}
 
+	private static void finishMovement(Minecraft client) {
+		if (activeMovementKey == null) return;
+		activeMovementKey.setDown(false);
+		activeMovementKey = null;
+		movementTicksRemaining = 0;
+		CompletableFuture<Map<String, Object>> completion = movementCompletion;
+		movementCompletion = null;
+		Map<String, Object> end = playerPosition(client);
+		if (completion != null) completion.complete(Map.of("accepted", true, "direction", activeMovementDirection,
+			"requestedTicks", movementRequestedTicks, "before", movementStart == null ? Map.of() : movementStart,
+			"after", end, "positionChanged", !end.equals(movementStart == null ? Map.of() : movementStart),
+			"status", statusSnapshot(client)));
+		activeMovementDirection = null;
+		movementRequestedTicks = 0;
+		movementStart = null;
+	}
+
+	private static void finishInteraction(Minecraft client) {
+		if (activeInteractionKey == null) return;
+		activeInteractionKey.setDown(false);
+		activeInteractionKey = null;
+		interactionTicksRemaining = 0;
+		CompletableFuture<Map<String, Object>> completion = interactionCompletion;
+		interactionCompletion = null;
+		if (completion != null) completion.complete(Map.of("accepted", true, "ticks", activeInteractionTicks,
+			"status", statusSnapshot(client)));
+		activeInteractionTicks = 0;
+	}
+
+	private static Map<String, Object> playerPosition(Minecraft client) {
+		var player = client.player;
+		return player == null ? Map.of() : Map.of("x", player.getX(), "y", player.getY(), "z", player.getZ());
+	}
+
+	private static void disablePauseOnLostFocusForAutomation(Minecraft client) {
+		if (pauseOnLostFocusBeforeAutomation == null) {
+			pauseOnLostFocusBeforeAutomation = client.options.pauseOnLostFocus;
+		}
+		client.options.pauseOnLostFocus = false;
+	}
+
+	private static void restorePauseOnLostFocus(Minecraft client) {
+		if (pauseOnLostFocusBeforeAutomation == null) return;
+		client.options.pauseOnLostFocus = pauseOnLostFocusBeforeAutomation;
+		pauseOnLostFocusBeforeAutomation = null;
+	}
+
 	public static synchronized void start() throws IOException {
 		if (server != null) return;
 		token = loadOrCreateToken();
@@ -177,6 +246,7 @@ public final class DebugBridge {
 		http.createContext("/v1/look", DebugBridge::look);
 		http.createContext("/v1/move", DebugBridge::move);
 		http.createContext("/v1/interact", DebugBridge::interact);
+		http.createContext("/v1/command", DebugBridge::runCommand);
 		http.createContext("/v1/screenshot", DebugBridge::screenshot);
 		http.createContext("/v1/worlds", DebugBridge::worlds);
 		http.createContext("/v1/worlds/create-test", DebugBridge::createTestWorld);
@@ -207,35 +277,45 @@ public final class DebugBridge {
 		}
 		if (!authorized(exchange)) return;
 		callOnClientThread(() -> {
-			Minecraft client = Minecraft.getInstance();
-			var player = client.player;
-			var level = client.level;
-			String worldId = currentSingleplayerWorldId(client);
-			return Map.of(
-				"connected", player != null && level != null,
-				"worldReady", player != null && level != null && "none".equals(currentScreen),
-				"singleplayer", client.hasSingleplayerServer(),
-				"playerPresent", player != null,
-				"worldPresent", level != null,
-				"screen", currentScreen,
-				"worldId", worldId,
-				"generatedByMcp", !worldId.isEmpty() && isGeneratedWorldId(worldId),
-				"player", player == null ? Map.of() : Map.of(
-					"x", player.getX(), "y", player.getY(), "z", player.getZ(),
-					"yaw", player.getYRot(), "pitch", player.getXRot()
-				)
-			);
+			return statusSnapshot(Minecraft.getInstance());
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 503, Map.of("error", "Minecraft client did not answer the status request"));
 			else respondQuietly(exchange, 200, result);
 		});
 	}
 
+	private static Map<String, Object> statusSnapshot(Minecraft client) {
+		var player = client.player;
+		var level = client.level;
+		String worldId = currentSingleplayerWorldId(client);
+		return Map.ofEntries(
+			Map.entry("connected", player != null && level != null),
+			Map.entry("worldReady", player != null && level != null && "none".equals(currentScreen)),
+			Map.entry("singleplayer", client.hasSingleplayerServer()),
+			Map.entry("playerPresent", player != null),
+			Map.entry("worldPresent", level != null),
+			Map.entry("windowActive", client.isWindowActive()),
+			Map.entry("screen", currentScreen),
+			Map.entry("worldId", worldId),
+			Map.entry("generatedByMcp", !worldId.isEmpty() && isGeneratedWorldId(worldId)),
+			Map.entry("gameMode", client.gameMode == null ? "none" : client.gameMode.getPlayerMode().getName()),
+			Map.entry("player", player == null ? Map.of() : Map.of(
+				"x", player.getX(), "y", player.getY(), "z", player.getZ(),
+				"yaw", player.getYRot(), "pitch", player.getXRot()
+			))
+		);
+	}
+
 	private static String currentSingleplayerWorldId(Minecraft client) {
 		IntegratedServer server = client.getSingleplayerServer();
 		if (server == null) return "";
-		Path folder = server.getWorldPath(LevelResource.ROOT).getFileName();
-		return folder == null ? "" : folder.toString();
+		Path saves = client.getLevelSource().getBaseDir().toAbsolutePath().normalize();
+		Path worldRoot = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize();
+		if (!worldRoot.startsWith(saves)) return "";
+		Path relative = saves.relativize(worldRoot).normalize();
+		if (relative.getNameCount() != 1) return "";
+		String worldId = relative.getFileName().toString();
+		return isSafeWorldId(worldId) ? worldId : "";
 	}
 
 	private static void performance(HttpExchange exchange) throws IOException {
@@ -252,7 +332,8 @@ public final class DebugBridge {
 			Minecraft client = Minecraft.getInstance();
 			Runtime runtime = Runtime.getRuntime();
 			long usedHeap = runtime.totalMemory() - runtime.freeMemory();
-			List<Map<String, String>> mods = FabricLoader.getInstance().getAllMods().stream()
+			var allMods = FabricLoader.getInstance().getAllMods();
+			List<Map<String, String>> mods = allMods.stream()
 				.limit(200)
 				.map(container -> Map.of(
 					"id", container.getMetadata().getId(),
@@ -272,16 +353,21 @@ public final class DebugBridge {
 					"averageMspt", recentIntegratedServerMspt, "observedTps", recentIntegratedServerTps,
 					"sampleWindowTicks", 20);
 			}
-			return Map.<String, Object>of(
-				"minecraftVersion", client.getLaunchedVersion(),
-				"fabricLoaderVersion", loaderVersion,
-				"fps", client.getFps(),
-				"frameTimeMs", client.getFrameTimeNs() / 1_000_000.0,
-				"heapUsedBytes", usedHeap,
-				"heapAllocatedBytes", runtime.totalMemory(),
-				"heapMaxBytes", runtime.maxMemory(),
-				"integratedServer", integratedServer,
-				"loadedMods", mods
+			String minecraftVersion = FabricLoader.getInstance().getModContainer("minecraft")
+				.map(container -> container.getMetadata().getVersion().getFriendlyString())
+				.orElse("unknown");
+			return Map.<String, Object>ofEntries(
+				Map.entry("minecraftVersion", minecraftVersion),
+				Map.entry("fabricLoaderVersion", loaderVersion),
+				Map.entry("fps", client.getFps()),
+				Map.entry("frameTimeMs", client.getFrameTimeNs() / 1_000_000.0),
+				Map.entry("heapUsedBytes", usedHeap),
+				Map.entry("heapAllocatedBytes", runtime.totalMemory()),
+				Map.entry("heapMaxBytes", runtime.maxMemory()),
+				Map.entry("loadedModCount", allMods.size()),
+				Map.entry("loadedModsTruncated", allMods.size() > mods.size()),
+				Map.entry("integratedServer", integratedServer),
+				Map.entry("loadedMods", mods)
 			);
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 503, Map.of("error", "Minecraft client did not answer the performance request"));
@@ -313,7 +399,11 @@ public final class DebugBridge {
 			control.put("y", widget.getY());
 			control.put("width", widget.getWidth());
 			control.put("height", widget.getHeight());
-			if (widget instanceof EditBox editBox) control.put("textLength", editBox.getValue().length());
+			if (widget instanceof EditBox editBox) {
+				control.put("textLength", editBox.getValue().length());
+				control.put("cursorPosition", editBox.getCursorPosition());
+				control.put("selectionLength", editBox.getHighlighted().length());
+			}
 			controls.add(control);
 		}
 		return Map.of(
@@ -361,7 +451,7 @@ public final class DebugBridge {
 			if (client.player != null || client.level != null) throw new IllegalStateException("Leave the current world before opening Create World");
 			CreateWorldScreen.openFresh(client, () -> client.setScreenAndShow(new SelectWorldScreen(new TitleScreen())));
 			return Map.<String, Object>of("accepted", true, "screen", "CreateWorldScreen",
-				"message", "Minecraft's Create World menu opened. Inspect get_menu_state, fill the visible controls, then activate its create button.");
+				"menu", currentUiState());
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", safeMessage(error)));
 			else respondQuietly(exchange, 202, result);
@@ -423,19 +513,31 @@ public final class DebugBridge {
 			if (isProtectedMenuAction(screen, label)) throw new IllegalStateException("This menu action could modify or delete an original save; use the allowlisted snapshot workflow instead");
 			boolean startsVanillaWorldCreation = screen instanceof CreateWorldScreen
 				&& label.toLowerCase(Locale.ROOT).contains("create");
-			if (startsVanillaWorldCreation) createWorldMenuPendingUntil = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3);
-			MouseButtonEvent event = new MouseButtonEvent(widget.getX() + widget.getWidth() / 2.0,
-				widget.getY() + widget.getHeight() / 2.0, new MouseButtonInfo(0, 0));
-			if (!screen.mouseClicked(event, false)) {
-				if (startsVanillaWorldCreation) createWorldMenuPendingUntil = 0L;
-				throw new IllegalStateException("Minecraft did not accept the menu click");
+			if (startsVanillaWorldCreation) {
+				createWorldMenuPendingUntil = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3);
+				disablePauseOnLostFocusForAutomation(Minecraft.getInstance());
 			}
+			String before = uiFingerprint(screen);
+			long beforeRevision = screenRevision;
+			MouseButtonEvent event = new MouseButtonEvent(widget.getX() + widget.getWidth() / 2.0,
+				widget.getY() + widget.getHeight() / 2.0, new MouseButtonInfo(InputConstants.MOUSE_BUTTON_LEFT, 0));
 			screen.afterMouseAction();
-			screenRevision++;
-			return Map.<String, Object>of("accepted", true, "screen", screen.getClass().getSimpleName(),
+			boolean pressed = screen.mouseClicked(event, false);
+			boolean released = pressed && screen.mouseReleased(event);
+			Screen resultingScreen = activeScreen;
+			String after = resultingScreen == null ? "none" : uiFingerprint(resultingScreen);
+			boolean changed = screen != resultingScreen || !before.equals(after);
+			if (!pressed || !released || (!changed && resultingScreen == screen)) {
+				if (startsVanillaWorldCreation) {
+					createWorldMenuPendingUntil = 0L;
+					restorePauseOnLostFocus(Minecraft.getInstance());
+				}
+				throw new IllegalStateException("Minecraft did not activate the selected control; no UI change was observed");
+			}
+			if (screenRevision == beforeRevision) screenRevision++;
+			return Map.<String, Object>of("accepted", true, "verified", true, "changed", true,
 				"controlIndex", index, "label", label.length() > 160 ? label.substring(0, 160) : label,
-				"screenRevision", screenRevision,
-				"message", "Menu control clicked. Inspect get_menu_state again before the next action.");
+				"screenRevision", screenRevision, "menu", currentUiState());
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", safeMessage(error)));
 			else respondQuietly(exchange, 200, result);
@@ -444,12 +546,32 @@ public final class DebugBridge {
 
 	private static boolean isProtectedMenuAction(Screen screen, String label) {
 		String normalized = label.toLowerCase(Locale.ROOT);
+		if (screen instanceof net.minecraft.client.gui.screens.PauseScreen) return !normalized.equals("back to game");
 		if (isEscapeOnlyScreen(screen)) return true;
 		if (List.of("delete", "remove", "erase", "reset to defaults", "restore defaults", "open to lan", "local network",
 			"share", "publish", "open folder", "browse", "import").stream().anyMatch(normalized::contains)) return true;
 		if (List.of("multiplayer", "realms").stream().anyMatch(normalized::contains)) return true;
 		return screen instanceof SelectWorldScreen
 			&& List.of("create", "back", "cancel").stream().noneMatch(normalized::contains);
+	}
+
+	private static String uiFingerprint(Screen screen) {
+		StringBuilder fingerprint = new StringBuilder(screen.getClass().getName()).append('|').append(screen.getTitle().getString());
+		for (AbstractWidget widget : visibleWidgets(screen)) {
+			fingerprint.append('|').append(widget.getClass().getName()).append(':')
+				.append(widget.getMessage().getString()).append(':').append(widget.active).append(':').append(widget.isFocused());
+			if (widget instanceof EditBox editBox) {
+				fingerprint.append(':').append(editBox.getValue()).append(':').append(editBox.getCursorPosition())
+					.append(':').append(editBox.getHighlighted());
+			}
+		}
+		return fingerprint.toString();
+	}
+
+	private static Map<String, Object> currentUiState() {
+		return activeScreen == null
+			? Map.of("screenRevision", screenRevision, "screen", "none", "title", "", "controls", List.of(), "truncated", false)
+			: uiState(activeScreen);
 	}
 
 	private static boolean isRemoteServerMenu(Screen screen) {
@@ -503,9 +625,11 @@ public final class DebugBridge {
 			if (index >= widgets.size() || !(widgets.get(index) instanceof EditBox editBox)) throw new IllegalArgumentException("Selected control is not a visible text field");
 			if (!editBox.active) throw new IllegalStateException("The selected text field is disabled");
 			editBox.setValue(requestedValue);
+			editBox.setCursorPosition(requestedValue.length());
 			screenRevision++;
 			return Map.<String, Object>of("accepted", true, "screen", screen.getClass().getSimpleName(), "controlIndex", index,
-				"screenRevision", screenRevision, "textLength", requestedValue.length(), "message", "Text set. Inspect the screen before submitting it.");
+				"verified", editBox.getValue().equals(requestedValue), "screenRevision", screenRevision,
+				"textLength", editBox.getValue().length(), "menu", uiState(screen));
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", safeMessage(error)));
 			else respondQuietly(exchange, 200, result);
@@ -536,19 +660,19 @@ public final class DebugBridge {
 			respond(exchange, 400, Map.of("error", "Expected screenRevision and an allowlisted menu key"));
 			return;
 		}
-		int keyCode = switch (key) {
-			case "enter" -> InputConstants.KEY_RETURN;
-			case "escape" -> InputConstants.KEY_ESCAPE;
-			case "tab" -> InputConstants.KEY_TAB;
-			case "up" -> InputConstants.KEY_UP;
-			case "down" -> InputConstants.KEY_DOWN;
-			case "left" -> InputConstants.KEY_LEFT;
-			case "right" -> InputConstants.KEY_RIGHT;
-			case "space" -> InputConstants.KEY_SPACE;
-			case "backspace" -> InputConstants.KEY_BACKSPACE;
-			default -> -1;
+		MenuKey menuKey = switch (key) {
+			case "enter" -> new MenuKey(InputConstants.KEY_RETURN, InputConstants.KEYCODE_RETURN);
+			case "escape" -> new MenuKey(InputConstants.KEY_ESCAPE, 27);
+			case "tab" -> new MenuKey(InputConstants.KEY_TAB, InputConstants.KEYCODE_TAB);
+			case "up" -> new MenuKey(InputConstants.KEY_UP, InputConstants.KEYCODE_UP);
+			case "down" -> new MenuKey(InputConstants.KEY_DOWN, InputConstants.KEYCODE_DOWN);
+			case "left" -> new MenuKey(InputConstants.KEY_LEFT, InputConstants.KEYCODE_LEFT);
+			case "right" -> new MenuKey(InputConstants.KEY_RIGHT, InputConstants.KEYCODE_RIGHT);
+			case "space" -> new MenuKey(InputConstants.KEY_SPACE, InputConstants.KEYCODE_SPACE);
+			case "backspace" -> new MenuKey(InputConstants.KEY_BACKSPACE, InputConstants.KEYCODE_BACKSPACE);
+			default -> null;
 		};
-		if (keyCode < 0) {
+		if (menuKey == null) {
 			respond(exchange, 400, Map.of("error", "Unsupported menu key"));
 			return;
 		}
@@ -560,8 +684,7 @@ public final class DebugBridge {
 			if (screen == null && "escape".equals(requestedKey) && client.player != null && client.level != null) {
 				client.pauseGame(true);
 				return Map.<String, Object>of("accepted", true, "screen", "PauseScreen", "key", requestedKey,
-					"screenRevision", screenRevision,
-					"message", "Opened the in-game pause menu. Inspect get_menu_state before the next action.");
+					"screenRevision", screenRevision, "changed", true, "menu", currentUiState());
 			}
 			if (screen == null) throw new IllegalStateException("There is no active menu screen to receive that key");
 			if (screen instanceof SelectWorldScreen && List.of("enter", "space").contains(requestedKey)) {
@@ -582,22 +705,36 @@ public final class DebugBridge {
 				throw new IllegalStateException("Confirmation screens for destructive actions are disabled");
 			}
 			boolean startsVanillaWorldCreation = screen instanceof CreateWorldScreen && "enter".equals(requestedKey);
-			if (startsVanillaWorldCreation) createWorldMenuPendingUntil = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3);
-			boolean handled = screen.keyPressed(new KeyEvent(keyCode, 0, 0));
-			if (!handled) {
-				if (startsVanillaWorldCreation) createWorldMenuPendingUntil = 0L;
+			if (startsVanillaWorldCreation) {
+				createWorldMenuPendingUntil = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3);
+				disablePauseOnLostFocusForAutomation(client);
+			}
+			String before = uiFingerprint(screen);
+			long beforeRevision = screenRevision;
+			KeyEvent event = new KeyEvent(menuKey.scanCode(), menuKey.keyCode(), 0);
+			screen.afterKeyboardAction();
+			boolean handled = screen.keyPressed(event);
+			boolean released = screen.keyReleased(event);
+			Screen resultingScreen = activeScreen;
+			String after = resultingScreen == null ? "none" : uiFingerprint(resultingScreen);
+			boolean changed = resultingScreen != screen || !before.equals(after);
+			if (!handled && !released && !changed) {
+				if (startsVanillaWorldCreation) {
+					createWorldMenuPendingUntil = 0L;
+					restorePauseOnLostFocus(client);
+				}
 				throw new IllegalStateException("The current screen did not accept that key");
 			}
-			screen.afterKeyboardAction();
-			screenRevision++;
-			return Map.<String, Object>of("accepted", true, "screen", screen.getClass().getSimpleName(), "key", requestedKey,
-				"screenRevision", screenRevision,
-				"message", "Menu key sent. Inspect get_menu_state again before the next action.");
+			if (screenRevision == beforeRevision) screenRevision++;
+			return Map.<String, Object>of("accepted", true, "handled", handled || released, "changed", changed,
+				"key", requestedKey, "screenRevision", screenRevision, "menu", currentUiState());
 		}).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", safeMessage(error)));
 			else respondQuietly(exchange, 200, result);
 		});
 	}
+
+	private record MenuKey(int scanCode, int keyCode) {}
 
 	private static String safeMessage(Throwable throwable) {
 		return rootMessage(throwable);
@@ -755,6 +892,7 @@ public final class DebugBridge {
 			respond(exchange, 400, Map.of("error", "direction must be forward/backward/left/right/jump and ticks must be 1..40"));
 			return;
 		}
+		CompletableFuture<Map<String, Object>> completion = new CompletableFuture<>();
 		callOnClientThread(() -> {
 			Minecraft client = Minecraft.getInstance();
 			if (client.player == null || client.level == null) throw new IllegalStateException("A world must be loaded before moving");
@@ -769,14 +907,17 @@ public final class DebugBridge {
 				case "jump" -> client.options.keyJump;
 				default -> throw new IllegalArgumentException("Unsupported movement direction");
 			};
+			movementStart = playerPosition(client);
+			movementRequestedTicks = ticks;
+			activeMovementDirection = direction;
+			movementCompletion = completion;
 			activeMovementKey = key;
 			movementTicksRemaining = ticks;
 			key.setDown(true);
-			return Map.<String, Object>of("accepted", true, "direction", direction, "ticks", ticks,
-				"durationSeconds", ticks / 20.0, "message", "Action will release automatically after the requested ticks.");
-		}).whenComplete((result, error) -> {
+			return completion;
+		}).thenCompose(future -> future).orTimeout(10, TimeUnit.SECONDS).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", rootMessage(error)));
-			else respondQuietly(exchange, 202, result);
+			else respondQuietly(exchange, 200, result);
 		});
 	}
 
@@ -805,6 +946,7 @@ public final class DebugBridge {
 			return;
 		}
 		int requestedTicks = ticks;
+		CompletableFuture<Map<String, Object>> completion = new CompletableFuture<>();
 		callOnClientThread(() -> {
 			Minecraft client = Minecraft.getInstance();
 			if (client.player == null || client.level == null) throw new IllegalStateException("A world must be loaded before interacting");
@@ -812,13 +954,63 @@ public final class DebugBridge {
 			if (activeInteractionKey != null) throw new IllegalStateException("An interaction action is already in progress");
 			if (client.options.keyUse.isDown()) throw new IllegalStateException("The use key is already held; release controls before automated interaction");
 			activeInteractionKey = client.options.keyUse;
+			activeInteractionTicks = requestedTicks;
+			interactionCompletion = completion;
 			interactionTicksRemaining = requestedTicks;
 			activeInteractionKey.setDown(true);
-			return Map.<String, Object>of("accepted", true, "ticks", requestedTicks,
-				"durationSeconds", requestedTicks / 20.0, "message", "Use action will release automatically after the requested ticks.");
-		}).whenComplete((result, error) -> {
+			return completion;
+		}).thenCompose(future -> future).orTimeout(10, TimeUnit.SECONDS).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", safeMessage(error)));
-			else respondQuietly(exchange, 202, result);
+			else respondQuietly(exchange, 200, result);
+		});
+	}
+
+	private static void runCommand(HttpExchange exchange) throws IOException {
+		if (!"/v1/command".equals(exchange.getRequestURI().getPath())) {
+			respond(exchange, 404, Map.of("error", "Unknown endpoint"));
+			return;
+		}
+		if (!"POST".equals(exchange.getRequestMethod())) {
+			respond(exchange, 405, Map.of("error", "Use POST"));
+			return;
+		}
+		if (!authorized(exchange)) return;
+		String command;
+		try {
+			JsonObject input = readSmallJsonObject(exchange);
+			if (!input.has("command") || !input.get("command").isJsonPrimitive() || !input.getAsJsonPrimitive("command").isString()) {
+				throw new IllegalArgumentException("Expected a slash command");
+			}
+			String raw = input.get("command").getAsString();
+			if (raw.length() > 256 || raw.chars().anyMatch(Character::isISOControl)) {
+				throw new IllegalArgumentException("Command must be at most 256 characters with no control characters");
+			}
+			command = raw.strip();
+			if (command.startsWith("/")) command = command.substring(1).stripLeading();
+			if (command.isEmpty() || command.startsWith("/") || command.length() > 256) {
+				throw new IllegalArgumentException("Expected one non-empty Minecraft command, with at most one leading slash");
+			}
+		} catch (IllegalArgumentException | JsonSyntaxException | IllegalStateException exception) {
+			respond(exchange, 400, Map.of("error", "Expected a Minecraft slash command of at most 256 characters"));
+			return;
+		}
+		String requestedCommand = command;
+		callOnClientThread(() -> {
+			Minecraft client = Minecraft.getInstance();
+			if (!client.hasSingleplayerServer() || client.player == null || client.level == null) {
+				throw new IllegalStateException("Commands are available only in a local single-player world");
+			}
+			if (!"none".equals(currentScreen)) throw new IllegalStateException("Close the current screen before sending a command");
+			String worldId = currentSingleplayerWorldId(client);
+			if (worldId.isEmpty() || !isGeneratedWorldId(worldId)) {
+				throw new IllegalStateException("Commands are limited to MCP-generated test worlds and disposable snapshots");
+			}
+			client.player.connection.sendCommand(requestedCommand);
+			return Map.<String, Object>of("accepted", true, "command", "/" + requestedCommand,
+				"worldId", worldId, "status", statusSnapshot(client));
+		}).whenComplete((result, error) -> {
+			if (error != null) respondQuietly(exchange, 409, Map.of("error", rootMessage(error)));
+			else respondQuietly(exchange, 200, result);
 		});
 	}
 
@@ -889,10 +1081,11 @@ public final class DebugBridge {
 			LevelSettings settings = new LevelSettings("Minecraft MCP Test", GameType.SURVIVAL,
 				LevelSettings.DifficultySettings.DEFAULT, true, WorldDataConfiguration.DEFAULT);
 			WorldOptions options = seed == null ? WorldOptions.defaultWithRandomSeed() : new WorldOptions(seed, true, false);
+			disablePauseOnLostFocusForAutomation(client);
 			client.createWorldOpenFlows().createFreshLevel(worldId, settings, options, WorldPresets::createNormalWorldDimensions, null);
 			return Map.<String, Object>of("accepted", true, "worldId", worldId,
-				"seed", options.seed(), "message", "World creation started. Poll get_game_status until worldReady is true.");
-		}, 50).whenComplete((result, error) -> {
+				"seed", options.seed(), "message", "World creation started.");
+		}, 180).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", rootMessage(error)));
 			else respondQuietly(exchange, 202, result);
 		});
@@ -911,9 +1104,14 @@ public final class DebugBridge {
 		callOnClientThread(() -> {
 			Minecraft client = Minecraft.getInstance();
 			if (!client.hasSingleplayerServer()) throw new IllegalStateException("No local single-player world is open");
-			client.disconnectWithSavingScreen();
-			return Map.of("accepted", true, "message", "Saving and returning to the title screen; poll get_game_status.");
-		}).whenComplete((result, error) -> {
+			try {
+				client.disconnect(new TitleScreen(), false);
+			} finally {
+				restorePauseOnLostFocus(client);
+			}
+			return Map.<String, Object>of("accepted", true, "returnedToTitle", activeScreen instanceof TitleScreen,
+				"status", statusSnapshot(client));
+		}, 180).whenComplete((result, error) -> {
 			if (error != null) respondQuietly(exchange, 409, Map.of("error", rootMessage(error)));
 			else respondQuietly(exchange, 202, result);
 		});
@@ -1009,6 +1207,7 @@ public final class DebugBridge {
 				if (client.player != null || client.level != null) throw new IllegalStateException("A world became active while the snapshot was being prepared");
 				WorldOpenFlows flows = client.createWorldOpenFlows();
 				openAttempted.set(true);
+				disablePauseOnLostFocusForAutomation(client);
 				flows.openWorld(snapshotId, () -> {});
 				return Map.<String, Object>of("accepted", true, "sourceWorldId", worldId, "snapshotWorldId", snapshotId,
 					"message", "Loading started. Poll get_game_status until worldReady is true.");
@@ -1109,6 +1308,7 @@ public final class DebugBridge {
 		callOnClientThread(() -> {
 			Minecraft client = Minecraft.getInstance();
 			if (client.player != null || client.level != null) throw new IllegalStateException("Return to the title screen before opening a generated world");
+			disablePauseOnLostFocusForAutomation(client);
 			client.createWorldOpenFlows().openWorld(worldId, () -> {});
 			return Map.<String, Object>of("accepted", true, "worldId", worldId,
 				"message", "Loading started. Poll get_game_status until worldReady is true.");
